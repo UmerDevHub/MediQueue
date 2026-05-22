@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+supabase==2.6.0
+python-dotenv
+pydantic[email]
+python-jose[cryptography]
+bcrypt
+python-multipart
+scikit-learn
+numpy
+supafunc==0.5.1
