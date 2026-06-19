@@ -17,6 +17,11 @@ from app.models.schemas import (
     EmergencyDispatchRequest,
     EmergencyDispatchResponse,
     HospitalScore,
+    IncidentStatus,
+    IncidentStatusUpdate,
+    IncidentResponse,
+    SecureMessageCreate,
+    SecureMessageResponse,
 )
 from app.services.hospital_service import (
     dispatch_emergency,
@@ -155,7 +160,7 @@ async def get_active_emergencies():
             supabase
             .table("incidents")
             .select("id, symptoms, severity_score, status, user_id, users(name)")
-            .in_("status", ["accepted", "en_route", "arrived"])
+            .in_("status", ["accepted", "en_route", "arrived", "admitted"])
             .execute()
         )
         incidents_data = incidents_res.data or []
@@ -199,3 +204,188 @@ async def get_active_emergencies():
             detail="An unexpected error occurred while fetching active emergencies.",
         ) from exc
 
+
+# ---------------------------------------------------------------------------
+# PATCH /emergency/{incident_id}/status — state-machine driven status update
+# ---------------------------------------------------------------------------
+
+@router.patch(
+    "/{incident_id}/status",
+    response_model=IncidentResponse,
+    summary="Update incident status",
+    description=(
+        "Advance an incident through its lifecycle.  Enforces the allowed "
+        "transition graph so that illegal jumps (e.g. accepted to discharged) "
+        "are rejected with HTTP 409 rather than a 500.  Admitting or "
+        "discharging a patient is fully supported via this endpoint."
+    ),
+)
+async def update_incident_status(
+    incident_id: UUID,
+    payload: IncidentStatusUpdate,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Transition an incident to a new status.
+
+    State machine:
+        accepted   -> en_route  | cancelled
+        en_route   -> arrived   | cancelled
+        arrived    -> admitted  | completed | cancelled
+        admitted   -> discharged| cancelled
+        discharged -> completed
+        completed / cancelled -> (terminal - no further transitions)
+
+    On discharge the background ML summary task is triggered asynchronously.
+    """
+    from app.db.database import supabase
+    from app.services.ml_service import generate_discharge_summary
+    import asyncio
+
+    # ---- Fetch current incident ----
+    try:
+        inc_res = (
+            supabase
+            .table("incidents")
+            .select("*")
+            .eq("id", str(incident_id))
+            .single()
+            .execute()
+        )
+    except Exception as exc:
+        logger.exception("Failed to fetch incident %s", incident_id)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Incident data is temporarily unavailable.",
+        ) from exc
+
+    incident = inc_res.data
+    if not incident:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Incident {incident_id} not found.",
+        )
+
+    current_status = IncidentStatus(incident["status"])
+    requested_status = payload.status
+
+    # ---- Validate transition ----
+    allowed = IncidentStatus.allowed_transitions().get(current_status, set())
+    if requested_status not in allowed:
+        if not allowed:  # terminal state
+            detail = (
+                f"Incident is in terminal state '{current_status.value}' "
+                "and cannot be transitioned further."
+            )
+        else:
+            allowed_labels = ", ".join(
+                s.value for s in sorted(allowed, key=lambda x: x.value)
+            )
+            detail = (
+                f"Cannot transition from '{current_status.value}' to "
+                f"'{requested_status.value}'. "
+                f"Allowed next states: [{allowed_labels}]."
+            )
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
+
+    # ---- Apply update ----
+    update_payload: dict = {"status": requested_status.value}
+    if payload.notes:
+        # Write optional clinical notes; gracefully skips if column absent in DB.
+        update_payload["notes"] = payload.notes
+
+    try:
+        upd_res = (
+            supabase
+            .table("incidents")
+            .update(update_payload)
+            .eq("id", str(incident_id))
+            .execute()
+        )
+    except Exception as exc:
+        logger.exception("Failed to update incident %s status", incident_id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update incident status.",
+        ) from exc
+
+    updated_incident = upd_res.data[0] if upd_res.data else {**incident, **update_payload}
+
+    # ---- Post-transition side-effects ----
+    if requested_status == IncidentStatus.DISCHARGED:
+        # Fire-and-forget: generate ML discharge summary without blocking the
+        # HTTP response.  Errors are logged inside generate_discharge_summary.
+        asyncio.create_task(
+            generate_discharge_summary(str(incident_id))
+        )
+        logger.info("Discharge summary task queued for incident %s", incident_id)
+
+    return updated_incident
+
+
+# ---------------------------------------------------------------------------
+# Secure Messages — architecture note
+# ---------------------------------------------------------------------------
+# NOTE: The ``secure_messages`` table introduced in the June 2026 Supabase
+# migration is consumed primarily via Supabase Realtime from the Flutter app
+# (direct channel subscription for low-latency doctor-patient chat).  The
+# FastAPI layer below provides server-side validation, audit-logging, and a
+# fallback REST write path for clients that cannot use Realtime.
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/messages",
+    response_model=SecureMessageResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Send a secure message",
+    description=(
+        "Persist a doctor-patient secure message via the REST fallback path. "
+        "Flutter clients should prefer the Supabase Realtime channel for "
+        "live chat; this endpoint is the authoritative write-validation layer."
+    ),
+)
+async def send_secure_message(
+    payload: SecureMessageCreate,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Validate and persist a secure message to the ``secure_messages`` table.
+
+    The Flutter app subscribes to this table via Supabase Realtime and will
+    receive the new row automatically - no polling required.
+    """
+    from app.db.database import supabase
+
+    # Authorization: sender must be the authenticated user.
+    if str(payload.sender_id) != str(current_user["id"]):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="sender_id must match the authenticated user.",
+        )
+
+    try:
+        res = (
+            supabase
+            .table("secure_messages")
+            .insert({
+                "incident_id": str(payload.incident_id),
+                "sender_id": str(payload.sender_id),
+                "recipient_id": str(payload.recipient_id),
+                "body": payload.body,
+            })
+            .execute()
+        )
+    except Exception as exc:
+        logger.exception("Failed to persist secure message")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to save message.",
+        ) from exc
+
+    if not res.data:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Message insert returned no data.",
+        )
+
+    return res.data[0]

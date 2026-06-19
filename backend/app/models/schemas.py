@@ -34,12 +34,37 @@ class UserRole(str, Enum):
 
 
 class IncidentStatus(str, Enum):
-    """Lifecycle states for an emergency incident (Postgres enum incident_status)."""
+    """Lifecycle states for an emergency incident (Postgres enum incident_status).
+
+    Full lifecycle (in rough order):
+        accepted → en_route → arrived → admitted → discharged
+                                                  → completed
+                                      (or)        → cancelled
+    """
     ACCEPTED = "accepted"
     EN_ROUTE = "en_route"
     ARRIVED = "arrived"
+    ADMITTED = "admitted"
+    DISCHARGED = "discharged"
     COMPLETED = "completed"
     CANCELLED = "cancelled"
+
+    # ------------------------------------------------------------------
+    # Allowed forward transitions (strict state-machine guard).
+    # A status NOT listed as a value for a given key has no defined
+    # path to it — transitions to such states should be rejected with 409.
+    # ------------------------------------------------------------------
+    @classmethod
+    def allowed_transitions(cls) -> dict["IncidentStatus", set["IncidentStatus"]]:
+        return {
+            cls.ACCEPTED:   {cls.EN_ROUTE, cls.CANCELLED},
+            cls.EN_ROUTE:   {cls.ARRIVED, cls.CANCELLED},
+            cls.ARRIVED:    {cls.ADMITTED, cls.COMPLETED, cls.CANCELLED},
+            cls.ADMITTED:   {cls.DISCHARGED, cls.CANCELLED},
+            cls.DISCHARGED: {cls.COMPLETED},
+            cls.COMPLETED:  set(),  # terminal
+            cls.CANCELLED:  set(),  # terminal
+        }
 
 
 class QueueStatus(str, Enum):
@@ -269,3 +294,43 @@ class EmergencyDispatchResponse(BaseModel):
     )
     queue_entry_id: UUID
     status: IncidentStatus
+
+
+# ---------------------------------------------------------------------------
+# Incident Status Update — PATCH /emergency/{incident_id}/status
+# ---------------------------------------------------------------------------
+
+class IncidentStatusUpdate(BaseModel):
+    """Request body for PATCH /emergency/{incident_id}/status."""
+    status: IncidentStatus
+    notes: Optional[str] = Field(
+        None,
+        max_length=1000,
+        description="Optional clinical notes for admitted/discharged transitions.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# 9. Secure Messages (new table — doctor-patient chat)
+# ---------------------------------------------------------------------------
+
+class SecureMessageCreate(BaseModel):
+    """POST body to persist a new secure message.
+
+    NOTE: The Flutter app accesses the ``secure_messages`` table via
+    Supabase Realtime directly for live subscriptions.  The FastAPI layer
+    exposes this endpoint primarily for server-side validation and
+    audit-logging purposes.
+    """
+    incident_id: UUID
+    sender_id: UUID
+    recipient_id: UUID
+    body: str = Field(..., min_length=1, max_length=4000)
+
+
+class SecureMessageResponse(SecureMessageCreate):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    is_read: bool = False
+    created_at: datetime

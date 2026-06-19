@@ -134,3 +134,88 @@ async def predict_wait_time(hospital_id: str) -> float:
 
     predicted_wait = max(predicted_wait, 0)
     return round(float(predicted_wait), 1)
+
+
+# ---------------------------------------------------------------------------
+# Discharge summary — triggered when incident status → discharged
+# ---------------------------------------------------------------------------
+
+async def generate_discharge_summary(incident_id: str) -> None:
+    """
+    Background task: generate a structured discharge summary for an incident.
+
+    Triggered asynchronously via ``asyncio.create_task`` when the incident
+    status transitions to ``discharged``.  This function never raises — all
+    exceptions are caught and logged so they never surface as unhandled task
+    exceptions.
+
+    Current behaviour:
+        - Fetches the incident row plus associated user demographics.
+        - Logs a structured summary dict (severity, symptoms, duration).
+        - Acts as a hook: replace the log statement with an ML model call,
+          an LLM summary generation, or a push-notification dispatch as the
+          product evolves.
+
+    Args:
+        incident_id: UUID string of the discharged incident.
+    """
+    logger.info("generate_discharge_summary: starting for incident_id=%s", incident_id)
+
+    try:
+        # ---- Fetch incident details ----
+        incident_res = (
+            supabase
+            .table("incidents")
+            .select("id, symptoms, severity_score, status, created_at, user_id, assigned_hospital_id")
+            .eq("id", incident_id)
+            .single()
+            .execute()
+        )
+        incident = incident_res.data
+        if not incident:
+            logger.warning(
+                "generate_discharge_summary: incident_id=%s not found — skipping.",
+                incident_id,
+            )
+            return
+
+        # ---- Fetch assigned hospital name (best-effort) ----
+        hospital_name: str = "Unknown"
+        if incident.get("assigned_hospital_id"):
+            try:
+                hosp_res = (
+                    supabase
+                    .table("hospitals")
+                    .select("name")
+                    .eq("id", incident["assigned_hospital_id"])
+                    .single()
+                    .execute()
+                )
+                hospital_name = (hosp_res.data or {}).get("name", "Unknown")
+            except Exception:
+                logger.warning(
+                    "generate_discharge_summary: could not fetch hospital for incident %s",
+                    incident_id,
+                )
+
+        # ---- Build summary payload ----
+        summary = {
+            "incident_id": incident_id,
+            "user_id": incident.get("user_id"),
+            "symptoms": incident.get("symptoms"),
+            "severity_score": incident.get("severity_score"),
+            "assigned_hospital": hospital_name,
+            "admitted_at": incident.get("created_at"),
+            "final_status": incident.get("status"),
+        }
+
+        # TODO: Replace this log with an LLM call, push notification, or
+        #       persisting to a ``discharge_summaries`` table as the product matures.
+        logger.info("generate_discharge_summary: summary=%s", summary)
+
+    except Exception:
+        # Never let a background task propagate an unhandled exception.
+        logger.exception(
+            "generate_discharge_summary: unhandled error for incident_id=%s",
+            incident_id,
+        )
