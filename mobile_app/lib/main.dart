@@ -1,9 +1,14 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'core/router.dart';
 import 'core/theme.dart';
 
 void main() {
-  runApp(const MediQueueApp());
+  runApp(
+    const ProviderScope(
+      child: MediQueueApp(),
+    ),
+  );
 }
 
 class MediQueueApp extends StatelessWidget {
