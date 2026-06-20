@@ -53,6 +53,20 @@ Future<bool> _hasSeenOnboarding() async {
   return prefs.getBool('seen_onboarding') ?? false;
 }
 
+Future<String> _getLoginRedirect() async {
+  final prefs = await SharedPreferences.getInstance();
+  final userJson = prefs.getString('user_profile');
+  if (userJson != null) {
+    try {
+      final userMap = jsonDecode(userJson);
+      final role = userMap['role'] ?? 'user';
+      if (role == 'doctor') return '/doctor_home';
+      if (role == 'hospital_admin') return '/admin_home';
+    } catch (_) {}
+  }
+  return '/user_home';
+}
+
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
@@ -80,7 +94,10 @@ final appRouter = GoRouter(
 
     if (!loggedIn && !isAuthRoute && !isOnboarding) return '/role_selection';
 
-    if (loggedIn && isAuthRoute) return '/user_home';
+    if (loggedIn && isAuthRoute) {
+      final redirectPath = await _getLoginRedirect();
+      return redirectPath;
+    }
 
     return null;
   },

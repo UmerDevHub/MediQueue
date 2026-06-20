@@ -132,4 +132,41 @@ class UserApiService {
       throw Exception('Failed to load wait time: $e');
     }
   }
+
+  /// Trigger an emergency dispatch.
+  Future<Map<String, dynamic>> dispatchEmergency({
+    required String userId,
+    required String symptoms,
+    required double severityScore,
+    required double lat,
+    required double lng,
+    required bool ambulanceRequired,
+  }) async {
+    final url = Uri.parse('${AppConfig.apiBaseUrl}/api/v1/emergency/dispatch');
+    try {
+      final response = await http.post(
+        url,
+        headers: _headers,
+        body: jsonEncode({
+          'user_id': userId,
+          'symptoms': symptoms,
+          'severity_score': severityScore,
+          'lat': lat,
+          'lng': lng,
+          'ambulance_required': ambulanceRequired,
+        }),
+      );
+
+      final responseBody = jsonDecode(response.body);
+
+      if (response.statusCode == 201) {
+        return responseBody;
+      } else {
+        final detail = responseBody['detail'] ?? 'Emergency dispatch failed';
+        throw Exception(detail);
+      }
+    } catch (e) {
+      throw Exception('Failed to dispatch emergency: $e');
+    }
+  }
 }
