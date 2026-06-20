@@ -10,8 +10,17 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-import numpy as np
-from sklearn.linear_model import SGDRegressor
+try:
+    import numpy as np
+    from sklearn.linear_model import SGDRegressor
+    HAS_ML_LIBRARIES = True
+except ImportError as err:
+    import logging
+    logging.getLogger("mediqueue.ml_service").warning(
+        f"ML libraries could not be imported (e.g., DLL load blocked by Application Control policy): {err}. "
+        "Falling back to queue heuristic."
+    )
+    HAS_ML_LIBRARIES = False
 
 from fastapi import HTTPException, status
 from app.db.database import supabase
@@ -25,9 +34,11 @@ logger = logging.getLogger("mediqueue.ml_service")
 _model: Optional[SGDRegressor] = None
 
 
-def _get_or_create_model() -> SGDRegressor:
+def _get_or_create_model() -> Optional[SGDRegressor]:
     """Lazily initialize the global SGDRegressor model."""
     global _model
+    if not HAS_ML_LIBRARIES:
+        return None
     if _model is None:
         _model = SGDRegressor(
             loss="squared_error",
@@ -100,14 +111,17 @@ async def predict_wait_time(hospital_id: str) -> float:
     fallback_avg_service_time = hospital_data.get("avg_service_time", 15) or 15
     current_queue_size = hospital_data.get("current_queue_size", 0) or 0
 
-    # ---- 3. Fallback if insufficient data ----
-    if len(load_log_data) < 5:
+    # ---- 3. Fallback if insufficient data or ML libraries are blocked ----
+    if not HAS_ML_LIBRARIES or len(load_log_data) < 5:
         logger.info(
-            "Insufficient data for hospital_id=%s (%d points). Returning fallback.",
+            "Insufficient data or ML libraries blocked for hospital_id=%s (%d points). Returning fallback.",
             hospital_id,
             len(load_log_data),
         )
-        return round(float(fallback_avg_service_time), 1)
+        calculated_wait = float(current_queue_size * fallback_avg_service_time)
+        if calculated_wait == 0:
+            calculated_wait = float(fallback_avg_service_time)
+        return round(calculated_wait, 1)
 
     # ---- 4. Prepare training data: X (queue_size), y (avg_service_time) ----
     X = np.array([[entry["queue_size"]] for entry in load_log_data]).reshape(-1, 1)
@@ -115,6 +129,12 @@ async def predict_wait_time(hospital_id: str) -> float:
 
     # ---- 5. Train model incrementally (warm_start=True) ----
     model = _get_or_create_model()
+    if model is None:
+        calculated_wait = float(current_queue_size * fallback_avg_service_time)
+        if calculated_wait == 0:
+            calculated_wait = float(fallback_avg_service_time)
+        return round(calculated_wait, 1)
+
     try:
         model.fit(X, y)
     except Exception as exc:
